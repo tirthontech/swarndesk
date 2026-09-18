@@ -2,7 +2,7 @@ import { Router } from "express";
 import { db } from "@workspace/db";
 import { purchasesTable, purchasePaymentTransactionsTable, journalVouchersTable } from "@workspace/db";
 import { eq, and, desc, isNull } from "drizzle-orm";
-import { postJournalEntry, getOrCreateDefaultAccounts, resolveMoneyAccountId, isValidBankAccount, safeFloat, reverseVoucherTx, type DefaultAccountKey } from "./accounting-helpers";
+import { postJournalEntry, getOrCreateDefaultAccounts, resolveMoneyAccountId, isValidBankAccount, safeFloat, reverseVoucherTx, type DefaultAccountKey, type DbExecutor } from "./accounting-helpers";
 
 const router = Router();
 
@@ -14,10 +14,10 @@ function inventoryAccountKey(metalType: string): DefaultAccountKey {
 // instead of cash/bank — books against the metal's inventory account, not a cash/bank account.
 async function paymentAccountId(
   userId: number, paymentMode: string, metalType: string, bankAccountId: number | null,
-  accts: Record<DefaultAccountKey, number>,
+  accts: Record<DefaultAccountKey, number>, exec: DbExecutor = db,
 ): Promise<number> {
   if (paymentMode === "fine") return accts[inventoryAccountKey(metalType)];
-  return resolveMoneyAccountId(userId, paymentMode, bankAccountId, accts);
+  return resolveMoneyAccountId(userId, paymentMode, bankAccountId, accts, exec);
 }
 
 // Raw bullion HSN codes — distinct from 7113 (finished jewellery, used on the sales side).
@@ -162,7 +162,7 @@ router.post("/", async (req, res) => {
         lines: [
           { accountId: accts[inventoryAccountKey(metalType)], debit: inventoryDebit, particulars: "Metal purchased" },
           { accountId: accts.INPUT_GST_CREDIT, debit: gstAmount ?? 0, particulars: "GST paid (ITC)" },
-          { accountId: await paymentAccountId(userId, paymentMode, metalType, bankAccountId, accts), credit: paidAmount, particulars: paymentMode === "fine" ? "Settled in fine metal" : "Paid to supplier" },
+          { accountId: await paymentAccountId(userId, paymentMode, metalType, bankAccountId, accts, tx), credit: paidAmount, particulars: paymentMode === "fine" ? "Settled in fine metal" : "Paid to supplier" },
           { accountId: accts.ACCOUNTS_PAYABLE, credit: balance, partyType: "supplier", partyId: supplierId, particulars: "Balance owed to supplier" },
         ],
       });
@@ -295,7 +295,7 @@ router.patch("/:id", async (req, res) => {
         lines: [
           { accountId: accts[inventoryAccountKey(metalType)], debit: inventoryDebit, particulars: "Metal purchased" },
           { accountId: accts.INPUT_GST_CREDIT, debit: gstAmount ?? 0, particulars: "GST paid (ITC)" },
-          { accountId: await paymentAccountId(userId, paymentMode, metalType, bankAccountId, accts), credit: paidAmount, particulars: paymentMode === "fine" ? "Settled in fine metal" : "Paid to supplier" },
+          { accountId: await paymentAccountId(userId, paymentMode, metalType, bankAccountId, accts, tx), credit: paidAmount, particulars: paymentMode === "fine" ? "Settled in fine metal" : "Paid to supplier" },
           { accountId: accts.ACCOUNTS_PAYABLE, credit: balance, partyType: "supplier", partyId: supplierId, particulars: "Balance owed to supplier" },
         ],
       });
@@ -420,7 +420,7 @@ router.post("/:id/payments", async (req, res) => {
         sourceId: id,
         lines: [
           { accountId: accts.ACCOUNTS_PAYABLE, debit: amount, partyType: "supplier", partyId: purchase.supplierId, particulars: "Balance settled" },
-          { accountId: await paymentAccountId(userId, paymentMode, purchase.metalType, bankAccountId, accts), credit: amount, particulars: paymentMode === "fine" ? "Settled in fine metal" : "Payment made" },
+          { accountId: await paymentAccountId(userId, paymentMode, purchase.metalType, bankAccountId, accts, tx), credit: amount, particulars: paymentMode === "fine" ? "Settled in fine metal" : "Payment made" },
         ],
       });
 

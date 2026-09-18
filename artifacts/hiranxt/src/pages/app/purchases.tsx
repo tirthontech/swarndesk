@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import React, { useState, useEffect } from "react";
 import { formatCurrency, formatDate, formatWeight } from "@/lib/utils";
 import {
   useListPurchases, useCreatePurchase, useUpdatePurchase, useCancelPurchase,
@@ -40,7 +40,7 @@ const PURITY_PERCENT: Record<string, number> = {
 
 // A plain number Input with a fixed, non-editable unit suffix ("gm", "%") shown inline at
 // the right edge — so the shop owner sees "20 gm" without the unit ever entering the value.
-function UnitInput({ suffix, className, ...props }: JSX.IntrinsicElements["input"] & { suffix: string }) {
+function UnitInput({ suffix, className, ...props }: React.ComponentProps<"input"> & { suffix: string }) {
   return (
     <div className="relative">
       <Input type="number" className={`pr-10 ${className ?? ""}`} {...props} />

@@ -148,8 +148,16 @@ router.patch("/payment-requests/:id/approve", async (req, res) => {
     // Duration comes from the plan the user actually selected at submission
     // time; requests from before planId/durationDays existed fall back to 30.
     const days = pr.durationDays ?? 30;
-    const subscriptionEndsAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-    if (pr.userId) await db.update(usersTable).set({ plan: "active", subscriptionEndsAt }).where(eq(usersTable.id, pr.userId));
+    if (pr.userId) {
+      // Stack onto whatever subscription time is still unused, exactly as
+      // /approve-custom and /users/:id/extend do. Dating the new period from "now"
+      // instead would silently burn the remaining days of anyone who renews early.
+      const [user] = await db.select().from(usersTable).where(eq(usersTable.id, pr.userId)).limit(1);
+      const base = user?.subscriptionEndsAt && new Date(user.subscriptionEndsAt) > new Date()
+        ? new Date(user.subscriptionEndsAt) : new Date();
+      const subscriptionEndsAt = new Date(base.getTime() + days * 24 * 60 * 60 * 1000);
+      await db.update(usersTable).set({ plan: "active", subscriptionEndsAt }).where(eq(usersTable.id, pr.userId));
+    }
     await logAdminAction(req, "approve_payment", pr.userId, pr.userNameSnapshot ?? pr.userEmailSnapshot, `Quick-approved ₹${pr.amount}${pr.planId ? ` (${pr.planId})` : ""} for ${days} days (UTR ${pr.utrNumber ?? "—"})`);
     res.json({ success: true });
   } catch (err) {

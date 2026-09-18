@@ -1,4 +1,4 @@
-import { pgTable, serial, text, numeric, timestamp, boolean, integer } from "drizzle-orm/pg-core";
+import { pgTable, serial, text, numeric, timestamp, boolean, integer, index } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 
@@ -31,7 +31,12 @@ export const businessSettingsTable = pgTable("business_settings", {
   loyaltyPointsEnabled: boolean("loyalty_points_enabled").notNull().default(true),
   loyaltyPointsRate: numeric("loyalty_points_rate", { precision: 10, scale: 2 }).notNull().default("1000"),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
-});
+}, (t) => [
+  // Read on nearly every request that touches settings, WhatsApp, girvi/accounting lazy
+  // init or a GST report, always as "latest row for this shop" — and until now with no
+  // index at all, so each of those was a sequential scan of every shop's settings.
+  index("business_settings_user_idx").on(t.userId, t.id.desc()),
+]);
 
 export const insertBusinessSettingsSchema = createInsertSchema(businessSettingsTable).omit({ id: true, updatedAt: true });
 export type InsertBusinessSettings = z.infer<typeof insertBusinessSettingsSchema>;

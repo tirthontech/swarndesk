@@ -26,11 +26,20 @@ const router = Router();
 
 router.post("/register", async (req, res) => {
   try {
-    const { email, password, name, shopName, mobile, referralCode } = req.body;
+    const { password, name, shopName, mobile, referralCode } = req.body;
+    // Coerced the same way staff.ts does, so a non-string email can't blow up on
+    // .toLowerCase() and surface as a 500 instead of a plain validation error.
+    const email = String(req.body.email ?? "").trim().toLowerCase();
     if (!email || !password || !name || !shopName) {
       return res.status(400).json({ error: "email, password, name, shopName are required" });
     }
-    const existing = await db.select().from(usersTable).where(eq(usersTable.email, email.toLowerCase())).limit(1);
+    // Same minimum the rest of the app enforces (staff creation, staff edit, and
+    // /change-password below) — without it the shop OWNER, the most privileged account
+    // in the shop, was the one account that could be created with a one-character password.
+    if (String(password).length < 8) {
+      return res.status(400).json({ error: "Password must be at least 8 characters" });
+    }
+    const existing = await db.select().from(usersTable).where(eq(usersTable.email, email)).limit(1);
     if (existing.length > 0) {
       return res.status(409).json({ error: "Email already registered" });
     }
@@ -38,7 +47,7 @@ router.post("/register", async (req, res) => {
     const trialEndsAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     const partnerId = await lookupActivePartnerId(referralCode);
     const [user] = await db.insert(usersTable).values({
-      email: email.toLowerCase(),
+      email,
       passwordHash,
       name,
       shopName,

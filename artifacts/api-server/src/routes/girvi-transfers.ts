@@ -106,7 +106,7 @@ router.post("/", async (req, res) => {
     const now = new Date();
 
     const settings = await getOrCreateGirviSettings(userId);
-    const transferNumber = await nextGirviNumber(userId, "transfer", settings.transferPrefix, now);
+    const transferNumber = await nextGirviNumber(userId, "transfer", settings.transferPrefix, now, settings.financialYearStartMonth);
 
     const transfer = await db.transaction(async tx => {
       const [created] = await tx.insert(girviTransfersTable).values({
@@ -238,7 +238,7 @@ router.post("/:id/return", async (req, res) => {
     const now = new Date();
     const returnNotes = req.body.notes ? String(req.body.notes).trim() || null : null;
     const settings = await getOrCreateGirviSettings(userId);
-    const returnVoucherNumber = await nextGirviNumber(userId, "transfer_return", `${settings.transferPrefix}-RTN`, now);
+    const returnVoucherNumber = await nextGirviNumber(userId, "transfer_return", `${settings.transferPrefix}-RTN`, now, settings.financialYearStartMonth);
 
     await db.transaction(async tx => {
       if (transfer.toBranchId !== null) {

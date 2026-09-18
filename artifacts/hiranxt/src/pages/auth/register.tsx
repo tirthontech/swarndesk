@@ -7,6 +7,9 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { useSEO } from "@/lib/seo";
 
+// Mirrors the server-side minimum in api-server routes/auth.ts.
+const MIN_PASSWORD_LENGTH = 8;
+
 export default function RegisterPage() {
   useSEO({
     title: "Sign Up Free — 7 Day Trial",
@@ -45,8 +48,11 @@ export default function RegisterPage() {
       setError("Passwords do not match");
       return;
     }
-    if (form.password.length < 6) {
-      setError("Password must be at least 6 characters");
+    // 8 is what the server enforces, and what staff accounts and the change-password
+    // screen already require — keep the three in step so the form can't call a password
+    // acceptable that registration then rejects.
+    if (form.password.length < MIN_PASSWORD_LENGTH) {
+      setError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
       return;
     }
     try {
@@ -159,8 +165,8 @@ export default function RegisterPage() {
                     </button>
                   </div>
                   {form.password.length > 0 && (
-                    <p className={`text-xs ${form.password.length >= 6 ? "text-green-600" : "text-destructive"}`}>
-                      {form.password.length >= 6 ? "Password length OK" : `At least ${6 - form.password.length} more character${6 - form.password.length !== 1 ? "s" : ""} needed`}
+                    <p className={`text-xs ${form.password.length >= MIN_PASSWORD_LENGTH ? "text-green-600" : "text-destructive"}`}>
+                      {form.password.length >= MIN_PASSWORD_LENGTH ? "Password length OK" : `At least ${MIN_PASSWORD_LENGTH - form.password.length} more character${MIN_PASSWORD_LENGTH - form.password.length !== 1 ? "s" : ""} needed`}
                     </p>
                   )}
                 </div>

@@ -1,12 +1,12 @@
 import { Router } from "express";
 import { db } from "@workspace/db";
 import { girviLoansTable, girviPaymentsTable, girviLoanItemsTable, girviCustomersTable, girviPartialReleasesTable, girviPartialReleaseItemsTable, girviTransfersTable } from "@workspace/db";
-import { eq, and, ne, desc, sql, inArray, isNull } from "drizzle-orm";
+import { eq, and, ne, desc, asc, lt, lte, gte, sql, inArray, isNull } from "drizzle-orm";
 import {
   safeFloat, mapLoan, mapPayment, calcAccruedInterest, preserveOutstandingBaseline,
   ensureDefaultBranch, getOrCreateGirviSettings, nextGirviNumber, computeLoanAggregatesFromItems,
   isLoanEditable,
-  VALID_METAL_TYPES, VALID_STATUSES, VALID_PERIODS, VALID_PAYMENT_MODES, VALID_PAYMENT_TYPES,
+  VALID_METAL_TYPES, VALID_STATUSES, VALID_PERIODS, VALID_PAYMENT_MODES, VALID_COLLECT_PAYMENT_TYPES,
   MAX_NOTES_LEN, MAX_ADDRESS_LEN,
 } from "./girvi-helpers";
 import { postJournalEntry, getOrCreateDefaultAccounts, resolveMoneyAccountId, isValidBankAccount, reverseVoucherTx } from "./accounting-helpers";
@@ -20,20 +20,51 @@ router.get("/stats/summary", async (req, res) => {
     const graceDays = settings.overdueGraceDays;
     // Voided loans never really happened (see isLoanEditable/DELETE /:id) — exclude
     // them from every stat here, same as if they'd never been entered at all.
-    const loans = await db.select().from(girviLoansTable)
-      .where(and(eq(girviLoansTable.userId, userId), ne(girviLoansTable.status, "voided")))
-      .orderBy(desc(girviLoansTable.createdAt));
+    //
+    // Split deliberately into two queries. The book-wide totals (collected, processing
+    // fees, forfeiture loss, loan count) are plain sums that Postgres returns as a single
+    // row, so they no longer require shipping every loan the shop has ever written to
+    // Node. Only the ACTIVE loans still come back as rows, because accrued interest is
+    // day-count maths that has to run per loan — and active loans are a small, roughly
+    // constant slice of a book that otherwise grows forever.
     const now = new Date();
-    const active = loans.filter(l => l.status === "active" || l.status === "extended");
+    const [bookTotals, active] = await Promise.all([
+      db.select({
+        totalLoans: sql<string>`count(*)`,
+        totalCollected: sql<string>`coalesce(sum(${girviLoansTable.totalInterestCollected}), 0)`,
+        totalProcessingFees: sql<string>`coalesce(sum(${girviLoansTable.processingFee}), 0)`,
+        totalLoss: sql<string>`coalesce(sum(${girviLoansTable.lossAmount}) filter (where ${girviLoansTable.status} = 'forfeited'), 0)`,
+      }).from(girviLoansTable)
+        .where(and(eq(girviLoansTable.userId, userId), ne(girviLoansTable.status, "voided"))),
+      // Only the columns calcAccruedInterest and the weight/date tallies below actually read.
+      db.select({
+        id: girviLoansTable.id,
+        status: girviLoansTable.status,
+        loanAmount: girviLoansTable.loanAmount,
+        principalPaid: girviLoansTable.principalPaid,
+        interestRate: girviLoansTable.interestRate,
+        penaltyRate: girviLoansTable.penaltyRate,
+        interestPeriod: girviLoansTable.interestPeriod,
+        startDate: girviLoansTable.startDate,
+        dueDate: girviLoansTable.dueDate,
+        metalType: girviLoansTable.metalType,
+        grossWeight: girviLoansTable.grossWeight,
+      }).from(girviLoansTable)
+        .where(and(eq(girviLoansTable.userId, userId), inArray(girviLoansTable.status, ["active", "extended"]))),
+    ]);
+
+    const totals = bookTotals[0];
     const overdue = active.filter(l => new Date(l.dueDate) < now);
     const totalLent = active.reduce((s, l) => {
-      const principalPaid = safeFloat((l as any).principalPaid ?? "0");
+      const principalPaid = safeFloat(l.principalPaid ?? "0");
       return s + Math.max(0, safeFloat(l.loanAmount) - principalPaid);
     }, 0);
-    const totalInterest = active.reduce((s, l) => s + calcAccruedInterest(l, now, graceDays).total, 0);
-    const totalLoss = loans.filter(l => l.status === "forfeited").reduce((s, l) => s + safeFloat(l.lossAmount), 0);
-    const totalCollected = loans.reduce((s, l) => s + safeFloat(l.totalInterestCollected), 0);
-    const totalProcessingFees = loans.reduce((s, l) => s + safeFloat(l.processingFee), 0);
+    const totalInterest = active.reduce(
+      (s, l) => s + calcAccruedInterest(l as unknown as typeof girviLoansTable.$inferSelect, now, graceDays).total, 0);
+    const totalLoss = safeFloat(totals?.totalLoss);
+    const totalCollected = safeFloat(totals?.totalCollected);
+    const totalProcessingFees = safeFloat(totals?.totalProcessingFees);
+    const totalLoans = Number(totals?.totalLoans ?? 0);
     const totalGoldWeight = active.filter(l => l.metalType === "gold").reduce((s, l) => s + safeFloat(l.grossWeight), 0);
     const totalSilverWeight = active.filter(l => l.metalType === "silver").reduce((s, l) => s + safeFloat(l.grossWeight), 0);
     const dueSoon = active.filter(l => {
@@ -50,7 +81,7 @@ router.get("/stats/summary", async (req, res) => {
       overdueCount: overdue.length,
       dueSoonCount: dueSoon.length,
       totalLoss: Math.round(totalLoss),
-      totalLoans: loans.length,
+      totalLoans,
       totalGoldWeight: Math.round(totalGoldWeight * 1000) / 1000,
       totalSilverWeight: Math.round(totalSilverWeight * 1000) / 1000,
     });
@@ -84,24 +115,50 @@ router.get("/", async (req, res) => {
       if (!isNaN(bid)) conditions.push(eq(girviLoansTable.branchId, bid));
     }
 
-    let loans = await db.select().from(girviLoansTable)
-      .where(and(...conditions))
-      .orderBy(desc(girviLoansTable.createdAt));
     const now = new Date();
+
+    // The due/mobile filters used to run in JS over the full result set, which meant the
+    // database still read and shipped every loan the shop had ever made even when the
+    // user was asking for the handful due today. Expressed here they become part of the
+    // WHERE clause, so the "overdue"/"today"/"week" tabs read only the rows they show —
+    // and the (userId, dueDate) index can serve the range.
+    if (due === "overdue" || due === "today" || due === "week") {
+      conditions.push(inArray(girviLoansTable.status, ["active", "extended"]));
+      if (due === "overdue") {
+        conditions.push(lt(girviLoansTable.dueDate, now));
+      } else {
+        const until = due === "today"
+          ? (() => { const d = new Date(now); d.setHours(23, 59, 59, 999); return d; })()
+          : new Date(now.getTime() + 7 * 86400000);
+        conditions.push(gte(girviLoansTable.dueDate, now));
+        conditions.push(lte(girviLoansTable.dueDate, until));
+      }
+    }
+
+    // Digit-only substring match, mirroring what the JS filter did character for character
+    // (stored numbers may carry spaces, +91 or dashes). It can't use an index, but doing
+    // it in the database returns just the matches instead of the whole book for Node to
+    // sift — and it keeps the cap below from hiding results the search should have found.
     if (mobile) {
       const digits = mobile.replace(/\D/g, "");
-      if (digits) loans = loans.filter(l => l.customerMobile.replace(/\D/g, "").includes(digits));
+      if (digits) {
+        // [^0-9] rather than \D: inside a JS template literal the backslash is eaten
+        // before the SQL ever sees it, which silently turns the pattern into a literal "D".
+        conditions.push(sql`regexp_replace(${girviLoansTable.customerMobile}, '[^0-9]', '', 'g') LIKE ${"%" + digits + "%"}`);
+      }
     }
-    if (due === "overdue") {
-      loans = loans.filter(l => (l.status === "active" || l.status === "extended") && new Date(l.dueDate) < now);
-    } else if (due === "today") {
-      const endOfDay = new Date(now); endOfDay.setHours(23, 59, 59, 999);
-      loans = loans.filter(l => (l.status === "active" || l.status === "extended") && new Date(l.dueDate) >= now && new Date(l.dueDate) <= endOfDay);
-    } else if (due === "week") {
-      const in7 = new Date(now.getTime() + 7 * 86400000);
-      loans = loans.filter(l => (l.status === "active" || l.status === "extended") && new Date(l.dueDate) >= now && new Date(l.dueDate) <= in7);
-    }
-    res.json(loans.map(l => mapLoan(l, new Date(), settings.overdueGraceDays)));
+
+    // A safety ceiling, not pagination: no realistic shop has 5000 loans matching one
+    // filter, but without any cap a single request can pin the whole table in memory.
+    // `?limit=` can ask for less; the UI does not paginate, so the default stays high
+    // enough that nothing a shop would actually look at gets truncated.
+    const limitNum = Math.min(5000, Math.max(1, parseInt(String(req.query.limit ?? "")) || 5000));
+
+    const loans = await db.select().from(girviLoansTable)
+      .where(and(...conditions))
+      .orderBy(desc(girviLoansTable.createdAt))
+      .limit(limitNum);
+    res.json(loans.map(l => mapLoan(l, now, settings.overdueGraceDays)));
   } catch (err) {
     req.log.error({ err }, "Failed to list girvi loans");
     res.status(500).json({ error: "Internal server error" });
@@ -208,7 +265,7 @@ router.post("/", async (req, res) => {
     const { grossWeight: totalGrossWeight, netWeight: totalNetWeight, estimatedValue: totalEstimatedValue, metalType: primaryMetal, purity: primaryPurity, itemDescription: autoDesc } = computeLoanAggregatesFromItems(lineTotals);
 
     const settings = await getOrCreateGirviSettings(userId);
-    const loanNumber = await nextGirviNumber(userId, "loan", settings.receiptPrefix, startDate);
+    const loanNumber = await nextGirviNumber(userId, "loan", settings.receiptPrefix, startDate, settings.financialYearStartMonth);
     const accts = await getOrCreateDefaultAccounts(userId);
 
     const disbursementMode = VALID_PAYMENT_MODES.has(data.disbursementMode) ? data.disbursementMode : "cash";
@@ -269,7 +326,7 @@ router.post("/", async (req, res) => {
       // Dr Girvi Loans Receivable (loanAmount) / Cr Cash-or-Bank (loanAmount - processingFee) +
       // Cr Processing Fee Income (processingFee) — money disbursed net of the upfront fee.
       const disbursed = loanAmount - processingFee;
-      const disbursementAccountId = await resolveMoneyAccountId(userId, disbursementMode, disbursementBankAccountId, accts);
+      const disbursementAccountId = await resolveMoneyAccountId(userId, disbursementMode, disbursementBankAccountId, accts, tx);
       const voucher = await postJournalEntry(tx, {
         userId,
         voucherDate: startDate,
@@ -295,6 +352,40 @@ router.post("/", async (req, res) => {
     res.status(201).json(mapLoan(loan, new Date(), settings.overdueGraceDays));
   } catch (err) {
     req.log.error({ err }, "Failed to create girvi loan");
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// "Today's Follow-Ups" — active loans overdue or due within `days` (default 3),
+// most urgent first. Deliberately independent of whatever status/due filter the
+// Loans tab currently has selected, so this always reflects the full book.
+//
+// Registered BEFORE "/:id" — Express matches in registration order, and
+// "follow-ups" would otherwise be captured as an :id and rejected as NaN.
+router.get("/follow-ups", async (req, res) => {
+  try {
+    const userId = req.user!.userId;
+    const settings = await getOrCreateGirviSettings(userId);
+    const days = Math.max(0, parseInt(String(req.query.days ?? "3")) || 3);
+    const now = new Date();
+    // Both filters belong in SQL: this used to read every loan the shop had ever made and
+    // throw away all but the handful due in the next few days. Status narrows to the live
+    // book, and the due-date cutoff narrows again to what this panel can actually show —
+    // overdue (dueDate < now) or due within `days` — which the girvi_user_due_idx serves.
+    const cutoff = new Date(now.getTime() + days * 86400000);
+    const loans = await db.select().from(girviLoansTable)
+      .where(and(
+        eq(girviLoansTable.userId, userId),
+        inArray(girviLoansTable.status, ["active", "extended"]),
+        lte(girviLoansTable.dueDate, cutoff),
+      ))
+      .orderBy(asc(girviLoansTable.dueDate));
+    const dueSoon = loans.map(l => mapLoan(l, now, settings.overdueGraceDays))
+      .filter(l => l.isOverdue || l.daysRemaining <= days)
+      .sort((a, b) => a.daysRemaining - b.daysRemaining);
+    res.json(dueSoon);
+  } catch (err) {
+    req.log.error({ err }, "Failed to build follow-ups list");
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -652,7 +743,7 @@ router.post("/:id/partial-release", async (req, res) => {
     })));
     const releasedDescription = releaseItems.map(it => `${it.quantity} ${it.itemType}${it.quantity > 1 ? "s" : ""}`).join(", ");
 
-    const releaseNumber = await nextGirviNumber(userId, "partial_release", settings.partialReleasePrefix, now);
+    const releaseNumber = await nextGirviNumber(userId, "partial_release", settings.partialReleasePrefix, now, settings.financialYearStartMonth);
     const accts = await getOrCreateDefaultAccounts(userId);
 
     const loanUpdates: Record<string, unknown> = {
@@ -720,7 +811,7 @@ router.post("/:id/partial-release", async (req, res) => {
           sourceModule: "girvi",
           sourceId: id,
           lines: [
-            { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts), debit: amt, particulars: "Payment received" },
+            { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts, tx), debit: amt, particulars: "Payment received" },
             ...(interestPortion > 0 ? [{ accountId: accts.INTEREST_INCOME, credit: interestPortion, particulars: "Interest portion" }] : []),
             ...(principalPortion > 0 ? [{ accountId: accts.GIRVI_LOANS_RECEIVABLE, credit: principalPortion, partyType: "girvi_customer" as const, partyId: loan.customerId ?? undefined, particulars: "Principal portion" }] : []),
           ],
@@ -796,7 +887,7 @@ router.post("/:id/send-notice", async (req, res) => {
     if (!mappedLoan.isOverdue) {
       return res.status(400).json({ error: "This loan is not overdue yet — a forfeiture notice can only be sent once the due date has passed" });
     }
-    const noticeNumber = await nextGirviNumber(userId, "notice", settings.noticePrefix, now);
+    const noticeNumber = await nextGirviNumber(userId, "notice", settings.noticePrefix, now, settings.financialYearStartMonth);
     const [updated] = await db.update(girviLoansTable)
       .set({ noticeSentAt: now, noticeNumber, updatedAt: now })
       .where(and(eq(girviLoansTable.id, id), eq(girviLoansTable.userId, userId)))
@@ -804,25 +895,6 @@ router.post("/:id/send-notice", async (req, res) => {
     res.json(mapLoan(updated, now, settings.overdueGraceDays));
   } catch (err) {
     req.log.error({ err }, "Failed to send forfeiture notice");
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-// "Today's Follow-Ups" — active loans overdue or due within `days` (default 3),
-// most urgent first. Deliberately independent of whatever status/due filter the
-// Loans tab currently has selected, so this always reflects the full book.
-router.get("/follow-ups", async (req, res) => {
-  try {
-    const userId = req.user!.userId;
-    const settings = await getOrCreateGirviSettings(userId);
-    const days = Math.max(0, parseInt(String(req.query.days ?? "3")) || 3);
-    const loans = await db.select().from(girviLoansTable).where(eq(girviLoansTable.userId, userId));
-    const now = new Date();
-    const active = loans.filter(l => l.status === "active" || l.status === "extended").map(l => mapLoan(l, now, settings.overdueGraceDays));
-    const dueSoon = active.filter(l => l.isOverdue || l.daysRemaining <= days).sort((a, b) => a.daysRemaining - b.daysRemaining);
-    res.json(dueSoon);
-  } catch (err) {
-    req.log.error({ err }, "Failed to build follow-ups list");
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -889,8 +961,10 @@ router.post("/:id/topup", async (req, res) => {
     const graceDays = settings.overdueGraceDays;
     const { total: accruedBeforeTopup } = calcAccruedInterest(loan, now, graceDays);
     const interestBaselineBefore = safeFloat((loan as any).interestBaseline ?? "0");
-    const collectedSinceReset = Math.max(0, safeFloat(loan.totalInterestCollected) - interestBaselineBefore);
-    const outstandingBeforeTopup = Math.max(0, accruedBeforeTopup - collectedSinceReset);
+    // Unfloored on purpose — a baseline above what's been collected is carried-forward
+    // unpaid interest, and flooring it here would forgive it. See mapLoan.
+    const creditSinceReset = safeFloat(loan.totalInterestCollected) - interestBaselineBefore;
+    const outstandingBeforeTopup = Math.max(0, accruedBeforeTopup - creditSinceReset);
 
     const accts = await getOrCreateDefaultAccounts(userId);
     const newTotalCollected = safeFloat(loan.totalInterestCollected) + paid;
@@ -950,7 +1024,7 @@ router.post("/:id/topup", async (req, res) => {
         sourceModule: "girvi", sourceId: id,
         lines: [
           { accountId: accts.GIRVI_LOANS_RECEIVABLE, debit: addAmt, partyType: "girvi_customer", partyId: loan.customerId ?? undefined, particulars: "Top-up principal disbursed" },
-          { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts), credit: addAmt, particulars: "Disbursed to customer (top-up)" },
+          { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts, tx), credit: addAmt, particulars: "Disbursed to customer (top-up)" },
         ],
       });
 
@@ -960,7 +1034,7 @@ router.post("/:id/topup", async (req, res) => {
           narration: `Interest collected at top-up on girvi loan ${loan.loanNumber}`,
           sourceModule: "girvi", sourceId: id,
           lines: [
-            { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts), debit: paid, particulars: "Interest received" },
+            { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts, tx), debit: paid, particulars: "Interest received" },
             { accountId: accts.INTEREST_INCOME, credit: paid, particulars: "Interest" },
           ],
         });
@@ -1010,7 +1084,7 @@ router.post("/:id/collect-interest", async (req, res) => {
     }
 
     const { amount, paymentType = "auto", notes, paymentMode, referenceNumber, bankAccountId: rawBankAccountId } = req.body;
-    if (!VALID_PAYMENT_TYPES.has(paymentType)) return res.status(400).json({ error: "Invalid payment type" });
+    if (!VALID_COLLECT_PAYMENT_TYPES.has(paymentType)) return res.status(400).json({ error: "Invalid payment type" });
     const amt = safeFloat(amount);
     if (amt <= 0 || !isFinite(amt)) return res.status(400).json({ error: "Amount must be a positive number" });
     const resolvedNotes = notes ? String(notes).slice(0, MAX_NOTES_LEN) : null;
@@ -1045,10 +1119,17 @@ router.post("/:id/collect-interest", async (req, res) => {
     const accts = await getOrCreateDefaultAccounts(userId);
 
     if (paymentType === "auto" && amt > outstandingInterest) {
+      // The validation above allows amt up to totalDue + 0.01 so a client echoing back a
+      // rounded totalDue isn't rejected over a stray paisa. Settle that slack here rather
+      // than carrying it into the postings: anything above totalDue can be allocated to
+      // neither interest nor principal, so it would land in the journal as a debit with no
+      // matching credit — under postJournalEntry's own 0.01 tolerance, hence silently
+      // written rather than rejected, leaving the trial balance a paisa out.
+      const allocatable = Math.min(amt, mappedLoan.totalDue);
       // Smart allocation: settle interest first, remainder reduces principal
-      const interestPortion = Math.min(amt, outstandingInterest);
+      const interestPortion = Math.min(allocatable, outstandingInterest);
       // Cap principal portion at current principal to prevent overpayment
-      const principalPortion = Math.min(amt - interestPortion, currentPrincipal);
+      const principalPortion = Math.min(allocatable - interestPortion, currentPrincipal);
       const newPrincipalPaid = safeFloat((loan as any).principalPaid ?? "0") + principalPortion;
       const remainingPrincipal = Math.max(0, safeFloat(loan.loanAmount) - newPrincipalPaid);
       const newTotalInterestCollected = safeFloat(loan.totalInterestCollected) + interestPortion;
@@ -1066,10 +1147,10 @@ router.post("/:id/collect-interest", async (req, res) => {
       let returnVoucherNumber: string | null = null;
       if (remainingPrincipal <= 0) {
         // Loan fully repaid
-        returnVoucherNumber = await nextGirviNumber(userId, "return", settings.returnPrefix, paymentDate);
+        returnVoucherNumber = await nextGirviNumber(userId, "return", settings.returnPrefix, paymentDate, settings.financialYearStartMonth);
         loanUpdates.status = "redeemed";
         loanUpdates.redeemedDate = paymentDate;
-        loanUpdates.redeemedAmount = amt.toFixed(2);
+        loanUpdates.redeemedAmount = allocatable.toFixed(2);
         loanUpdates.returnVoucherNumber = returnVoucherNumber;
       }
 
@@ -1115,7 +1196,7 @@ router.post("/:id/collect-interest", async (req, res) => {
           sourceModule: "girvi",
           sourceId: id,
           lines: [
-            { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts), debit: amt, particulars: "Payment received" },
+            { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts, tx), debit: allocatable, particulars: "Payment received" },
             { accountId: accts.INTEREST_INCOME, credit: interestPortion, particulars: "Interest portion" },
             { accountId: accts.GIRVI_LOANS_RECEIVABLE, credit: principalPortion, partyType: "girvi_customer", partyId: loan.customerId ?? undefined, particulars: "Principal portion" },
           ],
@@ -1161,7 +1242,7 @@ router.post("/:id/collect-interest", async (req, res) => {
             sourceModule: "girvi",
             sourceId: id,
             lines: [
-              { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts), debit: amt, particulars: "Payment received" },
+              { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts, tx), debit: amt, particulars: "Payment received" },
               { accountId: accts.INTEREST_INCOME, credit: amt, particulars: resolvedType === "penalty" ? "Penalty interest" : "Interest" },
             ],
           });
@@ -1213,8 +1294,10 @@ router.post("/:id/renew", async (req, res) => {
     const settings = await getOrCreateGirviSettings(userId);
     const { total: accruedBeforeRenewal } = calcAccruedInterest(loan, now, settings.overdueGraceDays);
     const interestBaselineBefore = safeFloat((loan as any).interestBaseline ?? "0");
-    const collectedSinceReset = Math.max(0, safeFloat(loan.totalInterestCollected) - interestBaselineBefore);
-    const outstandingBeforeRenewal = Math.max(0, accruedBeforeRenewal - collectedSinceReset);
+    // Unfloored on purpose — a baseline above what's been collected is carried-forward
+    // unpaid interest, and flooring it here would forgive it. See mapLoan.
+    const creditSinceReset = safeFloat(loan.totalInterestCollected) - interestBaselineBefore;
+    const outstandingBeforeRenewal = Math.max(0, accruedBeforeRenewal - creditSinceReset);
 
     const accts = await getOrCreateDefaultAccounts(userId);
 
@@ -1262,7 +1345,7 @@ router.post("/:id/renew", async (req, res) => {
           sourceModule: "girvi",
           sourceId: id,
           lines: [
-            { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts), debit: paid, particulars: "Renewal interest received" },
+            { accountId: await resolveMoneyAccountId(userId, resolvedMode, bankAccountId, accts, tx), debit: paid, particulars: "Renewal interest received" },
             { accountId: accts.INTEREST_INCOME, credit: paid, particulars: "Interest" },
           ],
         });
@@ -1315,8 +1398,10 @@ router.patch("/:id", async (req, res) => {
       }
       const { total: accruedInterest } = calcAccruedInterest(loan, now, graceDays);
       const interestBaseline = safeFloat((loan as any).interestBaseline ?? "0");
-      const collectedSinceReset = Math.max(0, safeFloat(loan.totalInterestCollected) - interestBaseline);
-      const outstanding = Math.max(0, accruedInterest - collectedSinceReset);
+      // Unfloored on purpose — a baseline above what's been collected is carried-forward
+      // unpaid interest, and flooring it here would forgive it. See mapLoan.
+      const creditSinceReset = safeFloat(loan.totalInterestCollected) - interestBaseline;
+      const outstanding = Math.max(0, accruedInterest - creditSinceReset);
       const principalPaid = safeFloat((loan as any).principalPaid ?? "0");
       const currentPrincipal = Math.max(0, safeFloat(loan.loanAmount) - principalPaid);
       const resolvedMode = VALID_PAYMENT_MODES.has(data.paymentMode) ? data.paymentMode : "cash";
@@ -1335,7 +1420,7 @@ router.patch("/:id", async (req, res) => {
       const interestToCollect = Math.max(0, outstanding - waiveInterest);
       const cashCollected = currentPrincipal + interestToCollect; // actual cash received — excludes any waived interest
 
-      const returnVoucherNumber = await nextGirviNumber(userId, "return", settings.returnPrefix, now);
+      const returnVoucherNumber = await nextGirviNumber(userId, "return", settings.returnPrefix, now, settings.financialYearStartMonth);
       const accts = await getOrCreateDefaultAccounts(userId);
 
       // Record the final interest + principal settlement as payments (mirrors the
@@ -1392,7 +1477,7 @@ router.patch("/:id", async (req, res) => {
           sourceModule: "girvi",
           sourceId: id,
           lines: [
-            { accountId: await resolveMoneyAccountId(userId, resolvedMode, redeemBankAccountId, accts), debit: cashCollected, particulars: "Redemption payment received" },
+            { accountId: await resolveMoneyAccountId(userId, resolvedMode, redeemBankAccountId, accts, tx), debit: cashCollected, particulars: "Redemption payment received" },
             { accountId: accts.GIRVI_LOANS_RECEIVABLE, credit: currentPrincipal, partyType: "girvi_customer", partyId: loan.customerId ?? undefined, particulars: "Principal settled" },
             { accountId: accts.INTEREST_INCOME, credit: interestToCollect, particulars: "Interest settled" },
           ],
@@ -1417,8 +1502,10 @@ router.patch("/:id", async (req, res) => {
       }
       const { total: accruedInterest } = calcAccruedInterest(loan, now, graceDays);
       const interestBaseline = safeFloat((loan as any).interestBaseline ?? "0");
-      const collectedSinceReset = Math.max(0, safeFloat(loan.totalInterestCollected) - interestBaseline);
-      const outstanding = Math.max(0, accruedInterest - collectedSinceReset);
+      // Unfloored on purpose — a baseline above what's been collected is carried-forward
+      // unpaid interest, and flooring it here would forgive it. See mapLoan.
+      const creditSinceReset = safeFloat(loan.totalInterestCollected) - interestBaseline;
+      const outstanding = Math.max(0, accruedInterest - creditSinceReset);
       const principalPaid = safeFloat((loan as any).principalPaid ?? "0");
       const currentPrincipal = Math.max(0, safeFloat(loan.loanAmount) - principalPaid);
       const totalDue = currentPrincipal + outstanding;
@@ -1426,7 +1513,7 @@ router.patch("/:id", async (req, res) => {
       if (goldSaleValue < 0) return res.status(400).json({ error: "Gold sale value cannot be negative" });
       const lossAmount = Math.max(0, totalDue - goldSaleValue);
 
-      const returnVoucherNumber = await nextGirviNumber(userId, "return", settings.returnPrefix, now);
+      const returnVoucherNumber = await nextGirviNumber(userId, "return", settings.returnPrefix, now, settings.financialYearStartMonth);
       const accts = await getOrCreateDefaultAccounts(userId);
       const forfeitUpdates: Partial<typeof girviLoansTable.$inferInsert> = {
         returnVoucherNumber,
@@ -1597,7 +1684,7 @@ router.patch("/:id", async (req, res) => {
                 { accountId: accts.GIRVI_LOANS_RECEIVABLE, debit: newLoanAmount, partyType: "girvi_customer", partyId: loan.customerId ?? undefined, particulars: "Loan disbursed (corrected)" },
                 // Re-post against whichever account the loan was originally disbursed from —
                 // this correction only fixes amount/rate/dates, not how the money moved.
-                { accountId: await resolveMoneyAccountId(userId, loan.disbursementMode, loan.disbursementBankAccountId, accts), credit: disbursed, particulars: "Disbursed to customer (corrected)" },
+                { accountId: await resolveMoneyAccountId(userId, loan.disbursementMode, loan.disbursementBankAccountId, accts, tx), credit: disbursed, particulars: "Disbursed to customer (corrected)" },
                 { accountId: accts.PROCESSING_FEE_INCOME, credit: newProcessingFee, particulars: "Processing fee" },
               ],
             });

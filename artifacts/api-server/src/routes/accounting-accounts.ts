@@ -2,7 +2,7 @@ import { Router } from "express";
 import { db } from "@workspace/db";
 import { chartOfAccountsTable, journalLinesTable } from "@workspace/db";
 import { eq, and } from "drizzle-orm";
-import { getOrCreateDefaultAccounts, safeFloat } from "./accounting-helpers";
+import { getOrCreateDefaultAccounts, invalidateDefaultAccounts, safeFloat } from "./accounting-helpers";
 
 const router = Router();
 
@@ -84,6 +84,7 @@ router.post("/", async (req, res) => {
         .where(and(eq(chartOfAccountsTable.userId, userId), eq(chartOfAccountsTable.accountSubType, "bank")));
     }
 
+    invalidateDefaultAccounts(userId);
     const [created] = await db.insert(chartOfAccountsTable).values({
       userId,
       code,
@@ -175,6 +176,7 @@ router.patch("/:id", async (req, res) => {
       updates.isDefaultBank = wantsDefault;
     }
 
+    invalidateDefaultAccounts(userId);
     const [updated] = await db.update(chartOfAccountsTable).set(updates)
       .where(and(eq(chartOfAccountsTable.id, id), eq(chartOfAccountsTable.userId, userId)))
       .returning();
@@ -202,6 +204,7 @@ router.delete("/:id", async (req, res) => {
       .where(and(eq(journalLinesTable.userId, userId), eq(journalLinesTable.accountId, id))).limit(1);
     if (line) return res.status(400).json({ error: "Cannot delete an account that already has journal entries — deactivate it instead" });
 
+    invalidateDefaultAccounts(userId);
     await db.delete(chartOfAccountsTable).where(and(eq(chartOfAccountsTable.id, id), eq(chartOfAccountsTable.userId, userId)));
     res.status(204).send();
   } catch (err) {

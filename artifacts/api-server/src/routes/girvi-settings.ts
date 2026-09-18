@@ -2,7 +2,7 @@ import { Router } from "express";
 import { db } from "@workspace/db";
 import { girviSettingsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
-import { getOrCreateGirviSettings, safeFloat, VALID_PERIODS } from "./girvi-helpers";
+import { getOrCreateGirviSettings, invalidateGirviSettings, safeFloat, VALID_PERIODS } from "./girvi-helpers";
 
 const router = Router();
 
@@ -110,6 +110,7 @@ router.patch("/", async (req, res) => {
     if (data.partialReleasePrefix !== undefined) updates.partialReleasePrefix = String(data.partialReleasePrefix).trim().toUpperCase() || "PRL";
     if (data.noticePrefix !== undefined) updates.noticePrefix = String(data.noticePrefix).trim().toUpperCase() || "NTC";
 
+    invalidateGirviSettings(userId);
     const [updated] = await db.update(girviSettingsTable).set(updates)
       .where(eq(girviSettingsTable.userId, userId))
       .returning();

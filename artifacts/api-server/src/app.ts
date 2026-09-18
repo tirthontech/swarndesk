@@ -3,6 +3,7 @@ import cors from "cors";
 import pinoHttp from "pino-http";
 import router from "./routes";
 import { logger } from "./lib/logger";
+import { compressionMiddleware } from "./middleware/compression";
 
 const app: Express = express();
 
@@ -26,8 +27,12 @@ app.use(
   }),
 );
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Before the routes so it can wrap res.json for every one of them.
+app.use(compressionMiddleware);
+// 512kb instead of express's 100kb default is still far below anything this API
+// legitimately accepts, and caps the memory a single malicious body can pin.
+app.use(express.json({ limit: "512kb" }));
+app.use(express.urlencoded({ extended: true, limit: "512kb" }));
 
 app.use("/api", router);
 

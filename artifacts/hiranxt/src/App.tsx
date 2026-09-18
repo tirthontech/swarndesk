@@ -1,42 +1,73 @@
+import { Suspense, lazy } from "react";
 import { Switch, Route, Router as WouterRouter, Redirect } from "wouter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/not-found";
 import LandingPage from "@/pages/landing";
-import BlogIndex from "@/pages/blog/index";
-import BlogPost from "@/pages/blog/post";
 import AppLayout from "@/components/AppLayout";
-import Dashboard from "@/pages/app/dashboard";
-import Inventory from "@/pages/app/inventory";
-import Billing from "@/pages/app/billing";
-import Customers from "@/pages/app/customers";
-import Karigars from "@/pages/app/karigars";
-import Repairs from "@/pages/app/repairs";
-import Purchases from "@/pages/app/purchases";
-import Reports from "@/pages/app/reports";
-import Settings from "@/pages/app/settings";
-import Girvi from "@/pages/app/girvi";
-import Marketing from "@/pages/app/marketing";
-import PendingPayments from "@/pages/app/pending-payments";
-import CustomOrders from "@/pages/app/custom-orders";
-import Accounting from "@/pages/app/accounting";
 import LoginPage from "@/pages/auth/login";
-import RegisterPage from "@/pages/auth/register";
-import PaymentPage from "@/pages/auth/payment";
-import AdminPage from "@/pages/admin/index";
-import PartnerLoginPage from "@/pages/partner/login";
-import PartnerSignupPage from "@/pages/partner/signup";
-import PartnerDashboardPage from "@/pages/partner/dashboard";
 import { AuthProvider, useAuth } from "@/contexts/AuthContext";
 import { TourProvider } from "@/contexts/TourContext";
 import { PartnerAuthProvider, usePartnerAuth } from "@/contexts/PartnerAuthContext";
 
+// Route-level code splitting. Everything used to arrive in one 1.65MB bundle, so a
+// visitor who only ever saw the landing page still downloaded the admin panel, the
+// partner dashboard and every module of the app. Each of these now ships as its own
+// chunk, fetched the first time its route is actually visited.
+//
+// Landing, login and the 404 stay eager: they are the first paint for an anonymous
+// visitor, and splitting them would only add a round-trip before anything renders.
+const BlogIndex = lazy(() => import("@/pages/blog/index"));
+const BlogPost = lazy(() => import("@/pages/blog/post"));
+const Dashboard = lazy(() => import("@/pages/app/dashboard"));
+const Inventory = lazy(() => import("@/pages/app/inventory"));
+const Billing = lazy(() => import("@/pages/app/billing"));
+const Customers = lazy(() => import("@/pages/app/customers"));
+const Karigars = lazy(() => import("@/pages/app/karigars"));
+const Repairs = lazy(() => import("@/pages/app/repairs"));
+const Purchases = lazy(() => import("@/pages/app/purchases"));
+const Reports = lazy(() => import("@/pages/app/reports"));
+const Settings = lazy(() => import("@/pages/app/settings"));
+const Girvi = lazy(() => import("@/pages/app/girvi"));
+const Marketing = lazy(() => import("@/pages/app/marketing"));
+const PendingPayments = lazy(() => import("@/pages/app/pending-payments"));
+const CustomOrders = lazy(() => import("@/pages/app/custom-orders"));
+const Accounting = lazy(() => import("@/pages/app/accounting"));
+const RegisterPage = lazy(() => import("@/pages/auth/register"));
+const PaymentPage = lazy(() => import("@/pages/auth/payment"));
+const AdminPage = lazy(() => import("@/pages/admin/index"));
+const PartnerLoginPage = lazy(() => import("@/pages/partner/login"));
+const PartnerSignupPage = lazy(() => import("@/pages/partner/signup"));
+const PartnerDashboardPage = lazy(() => import("@/pages/partner/dashboard"));
+
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      retry: 1,
-      staleTime: 30_000,
+      // A 4xx is a deterministic answer — the same request will get the same reply, so a
+      // retry is a second round-trip bought for nothing. It matters most in the cases
+      // that are already going wrong: an expired subscription answers 402 on every query
+      // on the page, and retrying doubled that burst. Only retry what might genuinely
+      // differ next time (network blips, 5xx).
+      retry: (failureCount, error: unknown) => {
+        const status = (error as { status?: number } | null)?.status;
+        if (typeof status === "number" && status >= 400 && status < 500) return false;
+        return failureCount < 1;
+      },
+      // Shop data changes when someone in the shop changes it, and every mutation here
+      // already invalidates the queries it affects. Two minutes of trust between those
+      // explicit refreshes cuts repeat fetches on navigation without showing stale
+      // figures after an action the user just took.
+      staleTime: 120_000,
+      // Keep results around long enough that moving between tabs and back reuses the
+      // cache instead of re-querying the server.
+      gcTime: 900_000,
+      // An ERP left open on a counter all day gets focused constantly; refetching every
+      // query each time is request volume with almost no informational value, given the
+      // invalidate-on-mutation above. Reconnect stays on, because a dropped connection
+      // genuinely can mean missed changes.
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: true,
     },
   },
 });
@@ -85,8 +116,20 @@ function ShopRoleRoute({ allow, children }: { allow: "isShopAdmin" | "canAccessA
   return <>{children}</>;
 }
 
+/** Shown while a route's chunk is in flight — deliberately minimal, since chunks are
+ * small and served from the CDN, so anything heavier would flash more than it reassures. */
+function RouteFallback() {
+  return (
+    <div className="flex min-h-[60vh] items-center justify-center" role="status" aria-live="polite">
+      <div className="h-6 w-6 animate-spin rounded-full border-2 border-muted border-t-primary" />
+      <span className="sr-only">Loading…</span>
+    </div>
+  );
+}
+
 function Router() {
   return (
+    <Suspense fallback={<RouteFallback />}>
     <Switch>
       <Route path="/" component={LandingPage} />
       <Route path="/blog" component={BlogIndex} />
@@ -131,6 +174,7 @@ function Router() {
       </Route>
       <Route component={NotFound} />
     </Switch>
+    </Suspense>
   );
 }
 

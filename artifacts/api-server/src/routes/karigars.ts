@@ -354,7 +354,7 @@ router.post("/:id/payments", async (req, res) => {
         sourceId: id,
         lines: [
           { accountId: accts.KARIGAR_WAGES_EXPENSE, debit: amount, partyType: "karigar", partyId: id, particulars: "Wages paid" },
-          { accountId: await resolveMoneyAccountId(userId, paymentMode, bankAccountId, accts), credit: amount, particulars: "Payment made" },
+          { accountId: await resolveMoneyAccountId(userId, paymentMode, bankAccountId, accts, tx), credit: amount, particulars: "Payment made" },
         ],
       });
 

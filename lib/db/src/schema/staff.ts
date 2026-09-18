@@ -25,6 +25,11 @@ export const staffTable = pgTable("staff", {
   // their own "priya@gmail.com" salesperson without colliding.
   uniqueIndex("staff_owner_email_idx").on(t.ownerUserId, t.email),
   index("staff_owner_idx").on(t.ownerUserId),
+  // Login looks a staff member up by email ALONE (routes/auth.ts loginAsStaff — the shop
+  // isn't known until the row is found). The composite above can't serve that, because
+  // email isn't its leading column, so without this every staff sign-in sequentially
+  // scans the whole staff table across all shops.
+  index("staff_email_idx").on(t.email),
 ]);
 
 export const insertStaffSchema = createInsertSchema(staffTable).omit({ id: true, createdAt: true, passwordHash: true });

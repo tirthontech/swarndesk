@@ -135,25 +135,34 @@ export default function LoansTab({ branches, autoOpenNew }: { branches: Branch[]
   const shopAddress = settings?.address ?? "";
   const shopMobile = settings?.mobile ?? "";
 
+  // Summary drives the stat cards AND the filter-tab counts, so it has to be refreshed
+  // after anything that moves money — including the collect/renew path below, which
+  // deliberately patches the loans list in place rather than reloading it.
+  const loadSummary = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/stats/summary`, { headers: authHeader() });
+      if (r.ok) setSummary(await r.json());
+    } catch { /* silent — the stat cards keep their last known values */ }
+  }, []);
+
   const loadAll = useCallback(async () => {
     setLoading(true);
     try {
       const params = new URLSearchParams();
       if (statusFilter !== "all") params.set("status", statusFilter);
       if (dueFilter !== "all") params.set("due", dueFilter);
-      const [loansRes, sumRes] = await Promise.all([
+      const [loansRes] = await Promise.all([
         fetch(`${API}?${params}`, { headers: authHeader() }),
-        fetch(`${API}/stats/summary`, { headers: authHeader() }),
+        loadSummary(),
       ]);
       if (loansRes.ok) setLoans(await loansRes.json());
       else if (loansRes.status !== 401) toast({ title: "Failed to load loans", variant: "destructive" });
-      if (sumRes.ok) setSummary(await sumRes.json());
     } catch {
       toast({ title: "Network error — please check your connection", variant: "destructive" });
     } finally {
       setLoading(false);
     }
-  }, [statusFilter, dueFilter]);
+  }, [statusFilter, dueFilter, loadSummary]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
@@ -325,6 +334,8 @@ export default function LoansTab({ branches, autoOpenNew }: { branches: Branch[]
         setLoanReleases(prev => { const n = { ...prev }; delete n[actionLoan.id]; return n; });
         setLastRelease({ release: result.release, loan: result.loan, releasedItems: result.releasedItems, remainingItems });
         toast({ title: `${releaseItemIds.length} item${releaseItemIds.length !== 1 ? "s" : ""} released. Print voucher below.` });
+        loadSummary();
+        loadFollowUps();
         setActionLoan(null); setActionType(null);
         setReleaseItemIds([]); setReleaseAmount("0"); setReleaseMode("cash"); setReleaseBankAccountId(null); setReleaseNotes("");
         setSubmitting(false);
@@ -408,6 +419,7 @@ export default function LoansTab({ branches, autoOpenNew }: { branches: Branch[]
         } else {
           toast({ title: "Loan renewed — interest clock reset!" });
         }
+        loadSummary();
         loadFollowUps();
       } else {
         const msgs: Record<string, string> = {

@@ -19,3 +19,19 @@
   from   = "/*"
   to     = "/index.html"
   status = 200
+
+# Vite fingerprints every file in /assets with a content hash, so a given URL's bytes can
+# never change — it is safe to let browsers and the CDN keep them for a year and stop
+# re-requesting them on each visit. Combined with the vendor chunking in vite.config.ts,
+# a routine deploy only invalidates the app chunks that actually changed.
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+# index.html is the one file that must NOT be cached: it is what points at the current
+# asset hashes, so a stale copy would keep loading a previous deploy's chunks.
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"

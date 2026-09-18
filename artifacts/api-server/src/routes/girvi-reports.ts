@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { db } from "@workspace/db";
 import { girviLoansTable, girviPaymentsTable, girviTransfersTable, girviBranchesTable, girviPartialReleasesTable } from "@workspace/db";
-import { eq } from "drizzle-orm";
+import { eq, and, ne, inArray, gte, lte } from "drizzle-orm";
 import { mapLoan, calcAccruedInterest, safeFloat, getOrCreateGirviSettings } from "./girvi-helpers";
 
 const router = Router();
@@ -14,15 +14,24 @@ function parseDateRange(req: any) {
   return { fromDate, toDate };
 }
 
+// Only these two statuses represent collateral still in the shop's custody.
+const ACTIVE_STATUSES = ["active", "extended"] as const;
+
 // 1. Pledge / Outstanding Register — statutory-register shape for active loans.
 router.get("/pledge-register", async (req, res) => {
   try {
     const userId = req.user!.userId;
     const settings = await getOrCreateGirviSettings(userId);
-    const loans = await db.select().from(girviLoansTable).where(eq(girviLoansTable.userId, userId));
-    const branches = await db.select().from(girviBranchesTable).where(eq(girviBranchesTable.userId, userId));
+    // Only live loans appear in this register, so only live loans are read — this used to
+    // fetch the shop's entire loan history and discard the closed ones in Node.
+    const [loans, branches] = await Promise.all([
+      db.select().from(girviLoansTable)
+        .where(and(eq(girviLoansTable.userId, userId), inArray(girviLoansTable.status, [...ACTIVE_STATUSES]))),
+      db.select({ id: girviBranchesTable.id, name: girviBranchesTable.name })
+        .from(girviBranchesTable).where(eq(girviBranchesTable.userId, userId)),
+    ]);
     const branchName = new Map(branches.map(b => [b.id, b.name]));
-    const active = loans.filter(l => l.status === "active" || l.status === "extended").map(l => mapLoan(l, new Date(), settings.overdueGraceDays));
+    const active = loans.map(l => mapLoan(l, new Date(), settings.overdueGraceDays));
     const rows = active.map(l => ({
       loanNumber: l.loanNumber,
       branch: branchName.get(l.branchId as number) ?? "—",
@@ -53,9 +62,10 @@ router.get("/maturity", async (req, res) => {
   try {
     const userId = req.user!.userId;
     const settings = await getOrCreateGirviSettings(userId);
-    const loans = await db.select().from(girviLoansTable).where(eq(girviLoansTable.userId, userId));
+    const loans = await db.select().from(girviLoansTable)
+      .where(and(eq(girviLoansTable.userId, userId), inArray(girviLoansTable.status, [...ACTIVE_STATUSES])));
     const now = new Date();
-    const active = loans.filter(l => l.status === "active" || l.status === "extended").map(l => mapLoan(l, now, settings.overdueGraceDays));
+    const active = loans.map(l => mapLoan(l, now, settings.overdueGraceDays));
     res.json({
       overdue: active.filter(l => l.isOverdue).sort((a, b) => a.daysRemaining - b.daysRemaining),
       dueThisWeek: active.filter(l => !l.isOverdue && l.daysRemaining <= 7),
@@ -73,11 +83,23 @@ router.get("/returns", async (req, res) => {
   try {
     const userId = req.user!.userId;
     const { fromDate, toDate } = parseDateRange(req);
-    const loans = await db.select().from(girviLoansTable).where(eq(girviLoansTable.userId, userId));
-    const loanNumberById = new Map(loans.map(l => [l.id, l.loanNumber]));
+    // Two different needs, previously served by one full-table read: the register rows
+    // themselves (closed loans inside the date window) and a loanId -> loanNumber lookup
+    // for labelling partial releases, which can point at a loan of any status. The first
+    // is now filtered in SQL; the second fetches two columns instead of all forty-three.
+    const [closedLoans, loanNumbers] = await Promise.all([
+      db.select().from(girviLoansTable).where(and(
+        eq(girviLoansTable.userId, userId),
+        inArray(girviLoansTable.status, ["redeemed", "forfeited"]),
+        gte(girviLoansTable.redeemedDate, fromDate),
+        lte(girviLoansTable.redeemedDate, toDate),
+      )),
+      db.select({ id: girviLoansTable.id, loanNumber: girviLoansTable.loanNumber })
+        .from(girviLoansTable).where(eq(girviLoansTable.userId, userId)),
+    ]);
+    const loanNumberById = new Map(loanNumbers.map(l => [l.id, l.loanNumber]));
 
-    const fullRows = loans
-      .filter(l => (l.status === "redeemed" || l.status === "forfeited") && l.redeemedDate && l.redeemedDate >= fromDate && l.redeemedDate <= toDate)
+    const fullRows = closedLoans
       .map(l => ({
         type: l.status as "redeemed" | "forfeited",
         loanNumber: l.loanNumber,
@@ -92,9 +114,12 @@ router.get("/returns", async (req, res) => {
         lossAmount: l.lossAmount ? safeFloat(l.lossAmount) : null,
       }));
 
-    const allReleases = await db.select().from(girviPartialReleasesTable).where(eq(girviPartialReleasesTable.userId, userId));
-    const releaseRows = allReleases
-      .filter(r => r.releaseDate >= fromDate && r.releaseDate <= toDate)
+    const releases = await db.select().from(girviPartialReleasesTable).where(and(
+      eq(girviPartialReleasesTable.userId, userId),
+      gte(girviPartialReleasesTable.releaseDate, fromDate),
+      lte(girviPartialReleasesTable.releaseDate, toDate),
+    ));
+    const releaseRows = releases
       .map(r => ({
         type: "partial_release" as const,
         loanNumber: loanNumberById.get(r.loanId) ?? "—",
@@ -155,18 +180,28 @@ router.get("/financial-summary", async (req, res) => {
     const userId = req.user!.userId;
     const settings = await getOrCreateGirviSettings(userId);
     const { fromDate, toDate } = parseDateRange(req);
-    const loans = await db.select().from(girviLoansTable).where(eq(girviLoansTable.userId, userId));
-    const payments = await db.select().from(girviPaymentsTable).where(eq(girviPaymentsTable.userId, userId));
-
-    // Voided loans were reversed in the books and never really happened — same
-    // "excluded from every stat" rule as girvi.ts's own GET /stats/summary.
-    const realLoans = loans.filter(l => l.status !== "voided");
+    // Everything below reads payments only up to `toDate` — the in-range figures for
+    // period activity, and everything on or before toDate to reconstruct closing
+    // balances. So the upper bound goes into SQL (payments recorded after the reporting
+    // period are never looked at) while the lower bound stays in JS, where the two
+    // different windows are separated. Voided loans are excluded in SQL for the same
+    // reason they were being dropped in JS: they were reversed and never really happened.
+    const [realLoans, payments] = await Promise.all([
+      db.select().from(girviLoansTable).where(and(
+        eq(girviLoansTable.userId, userId),
+        ne(girviLoansTable.status, "voided"),
+      )),
+      db.select().from(girviPaymentsTable).where(and(
+        eq(girviPaymentsTable.userId, userId),
+        lte(girviPaymentsTable.paymentDate, toDate),
+      )),
+    ]);
+    const paymentsInRange = payments.filter(p => p.paymentDate >= fromDate);
 
     // "Disbursed in range" keys off the loan's actual (possibly backdated)
     // startDate, not createdAt — a shop batching data entry days/weeks after
     // the fact would otherwise have that loan counted in the wrong period.
     const loansDisbursedInRange = realLoans.filter(l => l.startDate >= fromDate && l.startDate <= toDate);
-    const paymentsInRange = payments.filter(p => p.paymentDate >= fromDate && p.paymentDate <= toDate);
 
     const principalDisbursed = loansDisbursedInRange.reduce((s, l) => s + safeFloat(l.loanAmount), 0);
     const processingFeeIncome = loansDisbursedInRange.reduce((s, l) => s + safeFloat(l.processingFee), 0);
@@ -249,9 +284,10 @@ router.get("/aging", async (req, res) => {
   try {
     const userId = req.user!.userId;
     const settings = await getOrCreateGirviSettings(userId);
-    const loans = await db.select().from(girviLoansTable).where(eq(girviLoansTable.userId, userId));
+    const loans = await db.select().from(girviLoansTable)
+      .where(and(eq(girviLoansTable.userId, userId), inArray(girviLoansTable.status, [...ACTIVE_STATUSES])));
     const now = new Date();
-    const active = loans.filter(l => l.status === "active" || l.status === "extended").map(l => mapLoan(l, now, settings.overdueGraceDays));
+    const active = loans.map(l => mapLoan(l, now, settings.overdueGraceDays));
 
     const BUCKETS: { key: string; label: string; test: (l: ReturnType<typeof mapLoan>) => boolean }[] = [
       { key: "current", label: "Not Yet Due", test: l => !l.isOverdue },
@@ -289,8 +325,19 @@ router.get("/cash-compliance", async (req, res) => {
     const { fromDate, toDate } = parseDateRange(req);
     const settings = await getOrCreateGirviSettings(userId);
     const limit = safeFloat(settings.cashTransactionLimit, 200000);
-    const payments = await db.select().from(girviPaymentsTable).where(eq(girviPaymentsTable.userId, userId));
-    const cashInRange = payments.filter(p => p.paymentMode === "cash" && p.paymentDate >= fromDate && p.paymentDate <= toDate);
+    // Cash receipts inside the window are a small slice of the payment ledger; selecting
+    // them rather than every payment ever taken keeps this proportional to the period
+    // being reported on, and the (userId, paymentDate) index serves the range.
+    const cashInRange = await db.select({
+      customerName: girviPaymentsTable.customerName,
+      paymentDate: girviPaymentsTable.paymentDate,
+      amount: girviPaymentsTable.amount,
+    }).from(girviPaymentsTable).where(and(
+      eq(girviPaymentsTable.userId, userId),
+      eq(girviPaymentsTable.paymentMode, "cash"),
+      gte(girviPaymentsTable.paymentDate, fromDate),
+      lte(girviPaymentsTable.paymentDate, toDate),
+    ));
 
     const byCustomerDay = new Map<string, { customerName: string; date: string; total: number }>();
     for (const p of cashInRange) {

@@ -2,7 +2,7 @@ import { Router } from "express";
 import { db } from "@workspace/db";
 import { accountingSettingsTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
-import { getOrCreateAccountingSettings } from "./accounting-helpers";
+import { getOrCreateAccountingSettings, invalidateAccountingSettings } from "./accounting-helpers";
 
 const router = Router();
 
@@ -53,6 +53,7 @@ router.patch("/", async (req, res) => {
       }
     }
 
+    invalidateAccountingSettings(userId);
     const [updated] = await db.update(accountingSettingsTable).set(updates)
       .where(eq(accountingSettingsTable.userId, userId))
       .returning();

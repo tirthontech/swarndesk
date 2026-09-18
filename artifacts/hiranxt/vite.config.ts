@@ -23,6 +23,28 @@ export default defineConfig({
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        // Third-party code changes only when a dependency is upgraded, app code changes
+        // on every deploy. Kept in one bundle, a one-line fix invalidates the library
+        // bytes too and every returning user re-downloads them. Split out, these chunks
+        // keep their content hash across deploys and stay in the browser cache — which is
+        // bandwidth not served, on a host that bills for it.
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          // Charting is the heaviest dependency here and is only reached on two pages,
+          // so it gets its own chunk rather than loading with the shell.
+          if (id.includes("recharts") || id.includes("d3-")) return "vendor-charts";
+          if (id.includes("framer-motion")) return "vendor-motion";
+          if (id.includes("@radix-ui")) return "vendor-radix";
+          if (id.includes("react-dom") || id.includes("/react/") || id.includes("scheduler")) return "vendor-react";
+          return "vendor";
+        },
+      },
+    },
+    // The split above leaves every chunk well under this; keep the warning meaningful
+    // rather than silencing it.
+    chunkSizeWarningLimit: 600,
   },
   server: {
     port,

@@ -4,6 +4,19 @@ import {
   journalVouchersTable, journalLinesTable,
 } from "@workspace/db";
 import { eq, and, sql } from "drizzle-orm";
+import { TtlCache } from "../lib/cache";
+
+// Db transaction type used across the route files (tx param of db.transaction callback).
+type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+// Anything that can run a query: the pool-backed `db`, or an open transaction.
+//
+// Helpers that may be called from inside someone else's db.transaction MUST take
+// this and default to `db`. Using the module-level `db` while a transaction is open
+// checks out a SECOND connection from the pool: the write then commits even if the
+// surrounding transaction rolls back (gap-y counters, orphaned settings rows), and
+// under load — pg's pool defaults to max 10 — every busy transaction waiting on a
+// second connection that only a finishing transaction can release deadlocks the pool.
+export type DbExecutor = typeof db | Tx;
 
 export function safeFloat(val: unknown, fallback = 0): number {
   const n = parseFloat(String(val ?? ""));
@@ -19,9 +32,14 @@ export function getFinancialYear(date: Date, fyStartMonth = 4): string {
 }
 
 // Atomic, gap-free voucher numbering — literal port of girvi's nextGirviNumber.
-export async function nextVoucherNumber(userId: number, docType: string, prefix: string, asOf = new Date()): Promise<string> {
-  const financialYear = getFinancialYear(asOf);
-  const [row] = await db.insert(accountingCountersTable)
+// fyStartMonth comes from accounting_settings.financialYearStartMonth; callers that
+// already hold the settings row pass it in, the rest let it be looked up here. Passing
+// nothing would silently hardcode an April financial year and mislabel every voucher
+// number for a shop that configured a different one.
+export async function nextVoucherNumber(userId: number, docType: string, prefix: string, asOf = new Date(), exec: DbExecutor = db, fyStartMonth?: number): Promise<string> {
+  const startMonth = fyStartMonth ?? (await getOrCreateAccountingSettings(userId, exec)).financialYearStartMonth;
+  const financialYear = getFinancialYear(asOf, startMonth);
+  const [row] = await exec.insert(accountingCountersTable)
     .values({ userId, docType, financialYear, lastNumber: 1 })
     .onConflictDoUpdate({
       target: [accountingCountersTable.userId, accountingCountersTable.docType, accountingCountersTable.financialYear],
@@ -31,11 +49,26 @@ export async function nextVoucherNumber(userId: number, docType: string, prefix:
   return `${prefix}/${financialYear}/${String(row.lastNumber).padStart(4, "0")}`;
 }
 
-export async function getOrCreateAccountingSettings(userId: number) {
-  const [existing] = await db.select().from(accountingSettingsTable).where(eq(accountingSettingsTable.userId, userId));
-  if (existing) return existing;
-  const [mainSettings] = await db.select().from(businessSettingsTable).where(eq(businessSettingsTable.userId, userId));
-  const [created] = await db.insert(accountingSettingsTable).values({
+// Settings are read on essentially every accounting request and edited almost never.
+// Only rows that already existed are cached — a row created inside a caller's transaction
+// may still be rolled back, and caching it would leave this process serving an id that
+// was never committed.
+const accountingSettingsCache = new TtlCache<typeof accountingSettingsTable.$inferSelect>(60_000);
+
+export function invalidateAccountingSettings(userId: number) {
+  accountingSettingsCache.delete(String(userId));
+}
+
+export async function getOrCreateAccountingSettings(userId: number, exec: DbExecutor = db) {
+  const cached = accountingSettingsCache.get(String(userId));
+  if (cached) return cached;
+  const [existing] = await exec.select().from(accountingSettingsTable).where(eq(accountingSettingsTable.userId, userId));
+  if (existing) {
+    accountingSettingsCache.set(String(userId), existing);
+    return existing;
+  }
+  const [mainSettings] = await exec.select().from(businessSettingsTable).where(eq(businessSettingsTable.userId, userId));
+  const [created] = await exec.insert(accountingSettingsTable).values({
     userId,
     financialYearStartMonth: 4,
   }).returning();
@@ -82,12 +115,25 @@ export type DefaultAccountKey = typeof DEFAULT_ACCOUNTS[number]["key"];
 // Idempotently seeds any missing default accounts for the user, returns a
 // key -> accountId map. Called lazily by every posting call site (and by the
 // Chart of Accounts list endpoint), same lazy-init pattern as Girvi settings.
-export async function getOrCreateDefaultAccounts(userId: number): Promise<Record<DefaultAccountKey, number>> {
-  const existing = await db.select().from(chartOfAccountsTable).where(eq(chartOfAccountsTable.userId, userId));
+// Key -> account id, stable for the life of a shop once seeded. Previously re-read (a
+// full scan of the shop's chart of accounts) on every single posting — every sale,
+// purchase, repair, custom order and girvi payment paid for it.
+const defaultAccountsCache = new TtlCache<Record<DefaultAccountKey, number>>(300_000);
+
+export function invalidateDefaultAccounts(userId: number) {
+  defaultAccountsCache.delete(String(userId));
+}
+
+export async function getOrCreateDefaultAccounts(userId: number, exec: DbExecutor = db): Promise<Record<DefaultAccountKey, number>> {
+  const cached = defaultAccountsCache.get(String(userId));
+  if (cached) return cached;
+  const existing = await exec.select({
+    id: chartOfAccountsTable.id, code: chartOfAccountsTable.code,
+  }).from(chartOfAccountsTable).where(eq(chartOfAccountsTable.userId, userId));
   const byCode = new Map(existing.map(a => [a.code, a]));
   const missing = DEFAULT_ACCOUNTS.filter(a => !byCode.has(a.code));
   if (missing.length > 0) {
-    const inserted = await db.insert(chartOfAccountsTable).values(
+    const inserted = await exec.insert(chartOfAccountsTable).values(
       missing.map(a => ({
         userId, code: a.code, name: a.name, accountType: a.accountType,
         accountSubType: a.accountSubType, isSystemAccount: true,
@@ -100,6 +146,9 @@ export async function getOrCreateDefaultAccounts(userId: number): Promise<Record
     const row = byCode.get(a.code);
     if (row) map[a.key] = row.id;
   }
+  // Only cache a map read wholly from already-committed rows. If this call had to seed
+  // anything, the insert may belong to a caller's transaction that later rolls back.
+  if (missing.length === 0) defaultAccountsCache.set(String(userId), map);
   return map;
 }
 
@@ -129,10 +178,11 @@ export async function resolveMoneyAccountId(
   paymentMode: string | null | undefined,
   bankAccountId: number | null | undefined,
   defaults: Record<DefaultAccountKey, number>,
+  exec: DbExecutor = db,
 ): Promise<number> {
   if (cashOrBankKey(paymentMode) === "CASH") return defaults.CASH;
   if (bankAccountId) return bankAccountId;
-  const [defaultBank] = await db.select({ id: chartOfAccountsTable.id }).from(chartOfAccountsTable)
+  const [defaultBank] = await exec.select({ id: chartOfAccountsTable.id }).from(chartOfAccountsTable)
     .where(and(
       eq(chartOfAccountsTable.userId, userId), eq(chartOfAccountsTable.accountSubType, "bank"),
       eq(chartOfAccountsTable.isActive, true), eq(chartOfAccountsTable.isDefaultBank, true),
@@ -161,9 +211,6 @@ export interface PostJournalEntryInput {
   lines: JournalLineInput[];
 }
 
-// Db transaction type used across the route files (tx param of db.transaction callback).
-type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
-
 // The core posting primitive. Every module that moves money calls this from
 // inside its OWN db.transaction (pass that transaction's `tx`) so the journal
 // entry commits or rolls back atomically with the originating write. Throws
@@ -179,11 +226,11 @@ export async function postJournalEntry(tx: Tx, input: PostJournalEntryInput) {
     throw new Error(`postJournalEntry: unbalanced entry (debit ${totalDebit.toFixed(2)} != credit ${totalCredit.toFixed(2)}) for ${input.sourceModule}#${input.sourceId ?? "manual"}`);
   }
 
-  const settings = await getOrCreateAccountingSettings(input.userId);
+  const settings = await getOrCreateAccountingSettings(input.userId, tx);
   const voucherDate = input.voucherDate ?? new Date();
   const docType = input.voucherType === "receipt" ? "receipt" : input.voucherType === "payment" ? "payment" : "journal";
   const prefix = docType === "receipt" ? settings.receiptPrefix : docType === "payment" ? settings.paymentPrefix : settings.journalPrefix;
-  const voucherNumber = await nextVoucherNumber(input.userId, docType, prefix, voucherDate);
+  const voucherNumber = await nextVoucherNumber(input.userId, docType, prefix, voucherDate, tx, settings.financialYearStartMonth);
 
   const [voucher] = await tx.insert(journalVouchersTable).values({
     userId: input.userId,
@@ -224,8 +271,8 @@ export async function reverseVoucherTx(tx: Tx, userId: number, voucherId: number
   const lines = await tx.select().from(journalLinesTable)
     .where(and(eq(journalLinesTable.voucherId, voucherId), eq(journalLinesTable.userId, userId)));
 
-  const settings = await getOrCreateAccountingSettings(userId);
-  const voucherNumber = await nextVoucherNumber(userId, "journal", settings.journalPrefix, new Date());
+  const settings = await getOrCreateAccountingSettings(userId, tx);
+  const voucherNumber = await nextVoucherNumber(userId, "journal", settings.journalPrefix, new Date(), tx, settings.financialYearStartMonth);
   const [reversal] = await tx.insert(journalVouchersTable).values({
     userId,
     voucherNumber,

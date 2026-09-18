@@ -46,7 +46,7 @@ async function postCustomOrderPayment(
     sourceModule: "custom_orders",
     sourceId: order.id,
     lines: [
-      { accountId: await resolveMoneyAccountId(userId, paymentMode, bankAccountId, accts), debit: amount, particulars: "Payment received" },
+      { accountId: await resolveMoneyAccountId(userId, paymentMode, bankAccountId, accts, tx), debit: amount, particulars: "Payment received" },
       { accountId: accts.CUSTOM_ORDER_INCOME, credit: amount, particulars: "Custom order income" },
     ],
   });
@@ -178,7 +178,7 @@ router.post("/", async (req, res) => {
       // The advance collected at booking is real money in the till — it must hit the books
       // the same way a top-up or delivery-time collection does, not just sit in this row.
       if (advancePaid > 0) {
-        const accts = await getOrCreateDefaultAccounts(userId);
+        const accts = await getOrCreateDefaultAccounts(userId, tx);
         await postCustomOrderPayment(tx, userId, newOrder, advancePaid, paymentMode, bankAccountId, "Advance collected at booking", accts);
       }
 
@@ -298,7 +298,7 @@ router.patch("/:id", async (req, res) => {
         .returning();
 
       if (advanceDelta > 0) {
-        const accts = await getOrCreateDefaultAccounts(userId);
+        const accts = await getOrCreateDefaultAccounts(userId, tx);
         await postCustomOrderPayment(tx, userId, u, advanceDelta, paymentMode, bankAccountId, "Advance collected", accts);
       }
 

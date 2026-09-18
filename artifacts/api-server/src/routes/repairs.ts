@@ -278,7 +278,7 @@ router.post("/:id/payments", async (req, res) => {
         sourceModule: "repairs",
         sourceId: id,
         lines: [
-          { accountId: await resolveMoneyAccountId(userId, paymentMode, bankAccountId, accts), debit: amount, particulars: "Payment received" },
+          { accountId: await resolveMoneyAccountId(userId, paymentMode, bankAccountId, accts, tx), debit: amount, particulars: "Payment received" },
           { accountId: accts.REPAIR_INCOME, credit: amount, particulars: "Repair income" },
         ],
       });

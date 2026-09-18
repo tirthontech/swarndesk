@@ -6,7 +6,7 @@ import {
   repairPaymentTransactionsTable, customersTable, businessSettingsTable, paymentTransactionsTable,
   suppliersTable, karigarsTable,
 } from "@workspace/db";
-import { eq, and, gte, lte, lt, asc, sql, inArray } from "drizzle-orm";
+import { eq, and, gte, lte, lt, asc, sql, inArray, isNotNull } from "drizzle-orm";
 import { safeFloat, getOrCreateDefaultAccounts } from "./accounting-helpers";
 import { mapLoan, getOrCreateGirviSettings } from "./girvi-helpers";
 
@@ -423,12 +423,47 @@ router.get("/outstanding", async (req, res) => {
   try {
     const userId = req.user!.userId;
 
+    // Every row read here is reduced to {name, reference, amount} below, so each query
+    // selects only the columns that actually feed that — `select()` with no projection
+    // fetches every column of these very wide tables (sales and purchases carry 20+),
+    // which is pure wire and parse cost for data that is then dropped.
+    //
+    // The custom-order and purchase filters used to be "everything this shop ever
+    // recorded", narrowed in JS afterwards. Both now discard settled rows in SQL, so the
+    // work stops growing with the shop's history and stays proportional to what is
+    // genuinely still outstanding. The predicates mirror the old JS filters exactly:
+    // a purchase with a NULL paidAmount was treated as fully paid, and a custom order
+    // priced at final -> agreed -> estimated, first non-zero winning.
+    const outstandingOrderValue = sql`
+      coalesce(nullif(${customOrdersTable.finalPrice}, 0),
+               nullif(${customOrdersTable.agreedPrice}, 0),
+               ${customOrdersTable.estimatedPrice}, 0)
+      - coalesce(${customOrdersTable.advancePaid}, 0)`;
     const [pendingSales, activeLoans, openCustomOrders, unpaidPurchases, unpaidRepairs, allCustomers, allSuppliers, allKarigars] = await Promise.all([
-      db.select().from(salesTable).where(and(eq(salesTable.userId, userId), inArray(salesTable.paymentStatus, ["partial", "pending"]))),
+      db.select({
+        id: salesTable.id, customerName: salesTable.customerName, invoiceNumber: salesTable.invoiceNumber,
+        totalAmount: salesTable.totalAmount, paidAmount: salesTable.paidAmount,
+      }).from(salesTable).where(and(eq(salesTable.userId, userId), inArray(salesTable.paymentStatus, ["partial", "pending"]))),
       db.select().from(girviLoansTable).where(and(eq(girviLoansTable.userId, userId), inArray(girviLoansTable.status, ["active", "extended"]))),
-      db.select().from(customOrdersTable).where(eq(customOrdersTable.userId, userId)),
-      db.select().from(purchasesTable).where(eq(purchasesTable.userId, userId)),
-      db.select().from(repairJobsTable).where(and(eq(repairJobsTable.userId, userId), inArray(repairJobsTable.status, ["ready", "delivered"]))),
+      db.select({
+        id: customOrdersTable.id, customerName: customOrdersTable.customerName,
+        orderNumber: customOrdersTable.orderNumber, outstanding: sql<string>`${outstandingOrderValue}`,
+      }).from(customOrdersTable)
+        .where(and(eq(customOrdersTable.userId, userId), sql`${outstandingOrderValue} > 0.01`)),
+      db.select({
+        id: purchasesTable.id, supplierName: purchasesTable.supplierName,
+        invoiceNumber: purchasesTable.invoiceNumber, totalAmount: purchasesTable.totalAmount,
+        paidAmount: purchasesTable.paidAmount,
+      }).from(purchasesTable)
+        .where(and(
+          eq(purchasesTable.userId, userId),
+          isNotNull(purchasesTable.paidAmount),
+          sql`${purchasesTable.totalAmount} - ${purchasesTable.paidAmount} > 0.01`,
+        )),
+      db.select({
+        id: repairJobsTable.id, customerName: repairJobsTable.customerName,
+        actualCost: repairJobsTable.actualCost, estimatedCost: repairJobsTable.estimatedCost,
+      }).from(repairJobsTable).where(and(eq(repairJobsTable.userId, userId), inArray(repairJobsTable.status, ["ready", "delivered"]))),
       db.select({ id: customersTable.id, name: customersTable.name, balance: customersTable.balance }).from(customersTable).where(eq(customersTable.userId, userId)),
       db.select({ id: suppliersTable.id, name: suppliersTable.name, openingBalance: suppliersTable.openingBalance, openingBalanceType: suppliersTable.openingBalanceType }).from(suppliersTable).where(eq(suppliersTable.userId, userId)),
       db.select({ id: karigarsTable.id, name: karigarsTable.name, openingBalance: karigarsTable.openingBalance, openingBalanceType: karigarsTable.openingBalanceType }).from(karigarsTable).where(eq(karigarsTable.userId, userId)),
@@ -445,11 +480,10 @@ router.get("/outstanding", async (req, res) => {
       return { type: "girvi_loan" as const, id: l.id, name: l.customerName, reference: l.loanNumber, amount: round2(m.totalDue) };
     }).filter(r => r.amount > 0.01);
 
-    const debtorsCustomOrders = openCustomOrders.map(o => {
-      const price = safeFloat(o.finalPrice) || safeFloat(o.agreedPrice) || safeFloat(o.estimatedPrice);
-      const paid = safeFloat(o.advancePaid);
-      return { type: "custom_order" as const, id: o.id, name: o.customerName, reference: o.orderNumber, amount: round2(price - paid) };
-    }).filter(r => r.amount > 0.01 && r.reference);
+    const debtorsCustomOrders = openCustomOrders.map(o => ({
+      type: "custom_order" as const, id: o.id, name: o.customerName,
+      reference: o.orderNumber, amount: round2(safeFloat(o.outstanding)),
+    })).filter(r => r.amount > 0.01 && r.reference);
 
     const repairIds = unpaidRepairs.map(r => r.id);
     const repairPaidRows = repairIds.length > 0
@@ -467,11 +501,10 @@ router.get("/outstanding", async (req, res) => {
       return { type: "repair" as const, id: r.id, name: r.customerName, reference: `Repair #${r.id}`, amount: round2(cost - paid) };
     }).filter(r => r.amount > 0.01);
 
-    const creditorsPurchases = unpaidPurchases.map(p => {
-      const total = safeFloat(p.totalAmount);
-      const paid = p.paidAmount === null ? total : safeFloat(p.paidAmount);
-      return { type: "purchase" as const, id: p.id, name: p.supplierName, reference: p.invoiceNumber, amount: round2(total - paid) };
-    }).filter(r => r.amount > 0.01);
+    const creditorsPurchases = unpaidPurchases.map(p => ({
+      type: "purchase" as const, id: p.id, name: p.supplierName, reference: p.invoiceNumber,
+      amount: round2(safeFloat(p.totalAmount) - safeFloat(p.paidAmount)),
+    })).filter(r => r.amount > 0.01);
 
     // Pre-software opening balances — not tied to any live sale/purchase/loan row, so they
     // wouldn't otherwise show up here at all. A customer's positive balance is an advance

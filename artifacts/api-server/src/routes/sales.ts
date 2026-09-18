@@ -189,18 +189,38 @@ router.post("/", async (req, res) => {
     const moneyAccountId = await resolveMoneyAccountId(userId, data.paymentMode, bankAccountId, accts);
 
     const sale = await db.transaction(async (tx) => {
-      // 1. Lock inventory rows and check stock atomically
+      // 1. Lock inventory rows and check stock atomically.
+      // Quantities are summed PER INVENTORY ITEM first: the same item can legitimately
+      // appear on more than one line, and checking each line separately against the same
+      // stock level would let 2x3 units through against a stock of 4 and drive the row
+      // negative in step 3, since both checks run inside this one transaction.
+      const requestedByItemId = new Map<number, number>();
       for (const item of items) {
         const itemId = parseInt(item.inventoryItemId as unknown as string);
         if (!itemId || itemId <= 0) continue;
         const qty = parseInt(item.quantity as unknown as string);
+        requestedByItemId.set(itemId, (requestedByItemId.get(itemId) ?? 0) + qty);
+      }
+      // Ascending id order — a stable lock order, so two concurrent sales covering the
+      // same pair of items can't each hold one row and wait on the other.
+      for (const itemId of [...requestedByItemId.keys()].sort((a, b) => a - b)) {
+        const qty = requestedByItemId.get(itemId)!;
 
         // SELECT FOR UPDATE acquires a row lock — prevents concurrent deductions
         const rows = await tx.execute(
           sql`SELECT id, name, quantity FROM inventory_items WHERE id = ${itemId} AND user_id = ${userId} FOR UPDATE`
         );
         const inv = rows.rows[0] as { id: number; name: string; quantity: number } | undefined;
-        if (inv && Number(inv.quantity) < qty) {
+        // A missing row means the item was deleted, or never belonged to this shop. The
+        // decrement in step 3 would quietly match zero rows, leaving a sale line pointing
+        // at stock that was never taken out — reject instead of selling a phantom item.
+        if (!inv) {
+          throw Object.assign(
+            new Error(`Item no longer exists in inventory (id ${itemId}). Refresh and try again.`),
+            { statusCode: 422 }
+          );
+        }
+        if (Number(inv.quantity) < qty) {
           throw Object.assign(
             new Error(`Insufficient stock for "${inv.name}". Available: ${inv.quantity}, requested: ${qty}.`),
             { statusCode: 422 }
@@ -492,8 +512,8 @@ router.post("/:id/payments", async (req, res) => {
         .where(and(eq(salesTable.id, id), eq(salesTable.userId, userId)))
         .returning();
 
-      const accts = await getOrCreateDefaultAccounts(userId);
-      const moneyAccountId = await resolveMoneyAccountId(userId, paymentMode, bankAccountId, accts);
+      const accts = await getOrCreateDefaultAccounts(userId, tx);
+      const moneyAccountId = await resolveMoneyAccountId(userId, paymentMode, bankAccountId, accts, tx);
       await postJournalEntry(tx, {
         userId,
         voucherType: "receipt",
