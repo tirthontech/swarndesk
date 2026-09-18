@@ -26,18 +26,24 @@ export default defineConfig({
     rollupOptions: {
       output: {
         // Third-party code changes only when a dependency is upgraded, app code changes
-        // on every deploy. Kept in one bundle, a one-line fix invalidates the library
-        // bytes too and every returning user re-downloads them. Split out, these chunks
-        // keep their content hash across deploys and stay in the browser cache — which is
-        // bandwidth not served, on a host that bills for it.
+        // on every deploy, so keeping libraries in their own chunk lets them keep their
+        // content hash and stay in the browser cache across deploys.
+        //
+        // Only ONE library group is split off, and deliberately so. Splitting the
+        // remaining vendors further (react / radix / the rest) produced chunks that
+        // import each other — rollup reported "Circular chunk: vendor -> vendor-react ->
+        // vendor" — and circular ES chunks blow up with a temporal-dead-zone error during
+        // module initialisation, which renders as a blank page. A chunk is only safe to
+        // separate when nothing in the remaining bundle imports it back.
+        //
+        // Charting qualifies: recharts/d3 import React, React imports nothing of theirs,
+        // so the edge runs one way. It is also the single heaviest dependency and is
+        // reached from only two pages, so keeping it out of the entry is the bulk of the
+        // benefit anyway — the rest of the vendors are needed by the shell regardless and
+        // gain nothing from being split apart.
         manualChunks(id) {
           if (!id.includes("node_modules")) return undefined;
-          // Charting is the heaviest dependency here and is only reached on two pages,
-          // so it gets its own chunk rather than loading with the shell.
           if (id.includes("recharts") || id.includes("d3-")) return "vendor-charts";
-          if (id.includes("framer-motion")) return "vendor-motion";
-          if (id.includes("@radix-ui")) return "vendor-radix";
-          if (id.includes("react-dom") || id.includes("/react/") || id.includes("scheduler")) return "vendor-react";
           return "vendor";
         },
       },
